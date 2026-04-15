@@ -1,6 +1,6 @@
 {
   "name": "figma-local-mcp",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "mcpName": "io.github.MiHarsh/figma-local-mcp",
   "description": "Consume Figma design data from local JSON files — no API key, no rate limits, no internet required. Built on Framelink's extractor pipeline.",
   "type": "module",

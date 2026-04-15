@@ -1,5 +1,14 @@
 # figma-local-mcp
 
+## [0.3.1](https://github.com/MiHarsh/Figma-local-MCP/compare/v0.3.0...v0.3.1) (2026-04-15)
+
+
+### Bug Fixes
+
+* use npm install instead of npm ci for figma-plugin build ([808c1eb](https://github.com/MiHarsh/Figma-local-MCP/commit/808c1eb0baaee496ba06bb316232132aee25d308))
+* use npm install instead of npm ci for figma-plugin build ([07c1125](https://github.com/MiHarsh/Figma-local-MCP/commit/07c1125472169eff8112052fe858dbaf3d6ffd92))
+* use npm install instead of npm ci for figma-plugin build ([f26906f](https://github.com/MiHarsh/Figma-local-MCP/commit/f26906f98dc028a81b0e8e562f1f136e9da94607))
+
 ## [0.3.0](https://github.com/MiHarsh/Figma-local-MCP/compare/v0.2.0...v0.3.0) (2026-04-15)
 
 

@@ -124,7 +124,7 @@ jobs:
 
       - name: Install dependencies
         working-directory: figma-plugin
-        run: npm ci
+        run: npm install
 
       - name: Build plugin
         working-directory: figma-plugin

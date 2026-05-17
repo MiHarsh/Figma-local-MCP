@@ -471,6 +471,31 @@
         URL.revokeObjectURL(url);
       }
 
+      // Builds the "N node(s) skipped" sub-warning appended to the success
+      // toast. Listing a few node names inline + telling the user where the
+      // full list lives in the JSON keeps the toast useful without bloating
+      // it for the common case where errorCount is 0.
+      function escapeHtml(s) {
+        return String(s)
+          .replace(/&/g, "&amp;")
+          .replace(/</g, "&lt;")
+          .replace(/>/g, "&gt;");
+      }
+      function buildErrorNote(msg) {
+        if (!msg.errorCount) return "";
+        const examples = (msg.errorSummaries || []).map(escapeHtml).join(", ");
+        const more = msg.errorCount > (msg.errorSummaries || []).length
+          ? ` (\u2026and ${msg.errorCount - msg.errorSummaries.length} more)`
+          : "";
+        return (
+          `<div class="file-size" style="margin-top:6px;color:#b45309;">` +
+          `\u26a0 ${msg.errorCount} node${msg.errorCount === 1 ? "" : "s"} skipped due to Figma API errors` +
+          (examples ? `: ${examples}${more}` : "") +
+          `. See <code>framelinkExport.errors</code> in the JSON and the dev console for details.` +
+          `</div>`
+        );
+      }
+
       window.onmessage = (event) => {
         const msg = event.data.pluginMessage;
         if (!msg) return;
@@ -525,16 +550,20 @@
               statusEl.className = "status success";
               statusEl.innerHTML =
                 `Exported ${msg.nodeCount} root node${msg.nodeCount === 1 ? "" : "s"} + ${msg.assets.length} asset${msg.assets.length === 1 ? "" : "s"} to ${zipName}` +
-                `<div class="file-size">${formatBytes(zip.length)} (zip) — unzip into your repo, then point the MCP tool at <code>${jsonInZipPath}</code></div>`;
-              summary = `Exported ${zipName} (${formatBytes(zip.length)})`;
+                `<div class="file-size">${formatBytes(zip.length)} (zip) — unzip into your repo, then point the MCP tool at <code>${jsonInZipPath}</code></div>` +
+                buildErrorNote(msg);
+              summary = `Exported ${zipName} (${formatBytes(zip.length)})` +
+                (msg.errorCount ? ` (${msg.errorCount} skipped)` : "");
             } else {
               const jsonName = `${baseName}.json`;
               downloadBlob(jsonBytes, "application/json", jsonName);
               statusEl.className = "status success";
               statusEl.innerHTML =
                 `Exported ${msg.nodeCount} node${msg.nodeCount === 1 ? "" : "s"} to ${jsonName}` +
-                `<div class="file-size">${formatBytes(jsonBytes.length)}</div>`;
-              summary = `Exported ${jsonName} (${formatBytes(jsonBytes.length)})`;
+                `<div class="file-size">${formatBytes(jsonBytes.length)}</div>` +
+                buildErrorNote(msg);
+              summary = `Exported ${jsonName} (${formatBytes(jsonBytes.length)})` +
+                (msg.errorCount ? ` (${msg.errorCount} skipped)` : "");
             }
 
             // Give the browser a beat to flush the download dialog before the
@@ -589,23 +618,38 @@
         statusEl.style.display = "none";
         progressBarFill.style.width = "0%";
         progressPercent.textContent = "0%";
-        progressNode.textContent = "";
+        // Immediate hint so the user sees something happen before the
+        // sandbox sends its first throttled progress message (which can
+        // be 100ms+ away on large files).
+        progressNode.textContent = "Preparing export\u2026";
         progressContainer.classList.add("visible");
 
-        parent.postMessage(
-          {
-            pluginMessage: {
-              type: "export",
-              scope,
-              depth,
-              fileName,
-              exportFrameImages: exportFrameImages.checked,
-              exportSvgs: exportSvgs.checked,
-              exportImageFills: exportImageFills.checked,
-            },
-          },
-          "*",
-        );
+        // Why the double rAF: posting straight to the sandbox can let the
+        // sandbox start its synchronous countNodes / collectComponents work
+        // before the UI's paint frame lands, making the Cancel button feel
+        // laggy (the swap was already in the DOM but unpainted). Yielding
+        // two animation frames guarantees the browser paints the
+        // Export\u2192Cancel swap + the progress container before the sandbox
+        // begins blocking. Cost: ~16ms perceived delay before export starts,
+        // which is invisible vs. the actual export time.
+        requestAnimationFrame(() => {
+          requestAnimationFrame(() => {
+            parent.postMessage(
+              {
+                pluginMessage: {
+                  type: "export",
+                  scope,
+                  depth,
+                  fileName,
+                  exportFrameImages: exportFrameImages.checked,
+                  exportSvgs: exportSvgs.checked,
+                  exportImageFills: exportImageFills.checked,
+                },
+              },
+              "*",
+            );
+          });
+        });
       });
 
       cancelBtn.addEventListener("click", () => {

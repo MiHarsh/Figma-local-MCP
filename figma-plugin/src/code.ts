@@ -10,11 +10,33 @@
  * AI coding tools consume it locally.
  */
 
-const PLUGIN_VERSION = "1.2.0";
+const PLUGIN_VERSION = "1.3.0";
 
 // Image scale for rendered frame screenshots. @2x is a good tradeoff between
 // fidelity (handles retina, small text legible) and file size.
 const FRAME_IMAGE_SCALE = 2;
+
+// ── Debug logging ────────────────────────────────────────────────────────────
+// View these in Figma desktop via Plugins → Development → Open Console.
+// Flip DEBUG to false to silence everything before shipping.
+const DEBUG = true;
+const LOG_PREFIX = "[framelink]";
+
+function log(...args: unknown[]): void {
+  if (DEBUG) console.log(LOG_PREFIX, ...args);
+}
+function warn(...args: unknown[]): void {
+  if (DEBUG) console.warn(LOG_PREFIX, ...args);
+}
+function error(...args: unknown[]): void {
+  console.error(LOG_PREFIX, ...args);
+}
+function now(): number {
+  return typeof performance !== "undefined" && performance.now ? performance.now() : Date.now();
+}
+function ms(start: number): string {
+  return `${(now() - start).toFixed(0)}ms`;
+}
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -152,7 +174,32 @@ class ExportCancelled extends Error {
   constructor() { super("Export cancelled"); }
 }
 
-function yieldAndCheckCancel(): Promise<void> {
+/**
+ * Per-node `await setTimeout(0)` is catastrophic on large trees: browsers
+ * clamp `setTimeout(_, 0)` to ~4 ms and to ~10 ms+ after nested calls. A
+ * 10k-node export then spends 1–2 minutes inside timer queues alone — which
+ * is exactly the "slow / never completes" symptom on large files.
+ *
+ * Strategy: cancellation flag check is synchronous and free, so we do it
+ * every node. We only *actually* yield (a real macrotask via setTimeout 0)
+ * every YIELD_INTERVAL nodes, which is enough to keep the UI responsive and
+ * let postMessages flush without paying the timer-clamp tax per node.
+ */
+const YIELD_INTERVAL = 500;
+let yieldCounter = 0;
+
+function resetYieldCounter() {
+  yieldCounter = 0;
+}
+
+function checkCancelled() {
+  if (cancelled) throw new ExportCancelled();
+}
+
+function maybeYield(): Promise<void> | void {
+  checkCancelled();
+  if (++yieldCounter < YIELD_INTERVAL) return;
+  yieldCounter = 0;
   return new Promise((resolve, reject) => setTimeout(() => {
     if (cancelled) reject(new ExportCancelled());
     else resolve();
@@ -192,6 +239,15 @@ const SVG_LEAF_TYPES = new Set([
 
 const SVG_CONTAINER_TYPES = new Set(["FRAME", "GROUP", "INSTANCE", "BOOLEAN_OPERATION"]);
 
+// Primitives whose geometry is inherently complex (curves, custom paths,
+// multi-vertex shapes). Worth a standalone SVG even when they appear alone.
+const SVG_COMPLEX_PRIMITIVES = new Set(["VECTOR", "BOOLEAN_OPERATION", "STAR", "REGULAR_POLYGON"]);
+
+// Primitives whose geometry is fully describable by the JSON's size + fills +
+// strokes (a lone RECTANGLE / ELLIPSE / LINE is just bbox + paint data). These
+// are only worth an SVG when they're part of a multi-primitive composition.
+const SVG_SIMPLE_PRIMITIVES = new Set(["LINE", "ELLIPSE", "RECTANGLE"]);
+
 function nodeHasImageFill(node: SceneNode): boolean {
   if (!("fills" in node)) return false;
   const fills = node.fills;
@@ -200,42 +256,167 @@ function nodeHasImageFill(node: SceneNode): boolean {
 }
 
 /**
- * Walk a subtree once and return the set of node IDs that are the topmost
- * "all-SVG" nodes — i.e. nodes whose entire subtree is vector-only and
- * whose parent is NOT also all-SVG. These are the nodes worth rendering as
- * standalone SVG files; rendering inner nodes too would duplicate content.
+ * Decide whether a candidate "all-vector" subtree is actually worth
+ * round-tripping through `exportAsync`. Without this filter, a typical UI
+ * design page surfaces 1000+ candidates (every hidden node, every empty
+ * rectangle, every 1px separator) of which 10–20 are real icons. The
+ * round-trip cost of `exportAsync` on the dead candidates dominates the
+ * asset phase.
+ *
+ * Filter logic, in order of cheapness:
+ *   1. Node (or any ancestor) is invisible → skip. `absoluteRenderBounds`
+ *      returns null when Figma's renderer would produce nothing for this
+ *      subtree, which captures inherited visibility too.
+ *   2. Render bounds are zero-area → skip. Includes "width=0" spacers and
+ *      fully-clipped nodes.
+ *   3. Subtree contains at least one complex vector primitive (path-based
+ *      shape) → export. These can't be losslessly described by JSON.
+ *   4. Subtree contains ≥2 primitives total → export. A composition of
+ *      simple shapes is also worth visual fidelity.
+ *   5. Otherwise (single trivial primitive) → skip. The JSON's size + fills
+ *      + strokes already describes it perfectly.
  */
-function collectSvgRoots(node: SceneNode): Set<string> {
-  const roots = new Set<string>();
+function isSvgWorthExporting(node: SceneNode): boolean {
+  if (node.visible === false) return false;
 
-  function isAllSvg(n: SceneNode): boolean {
-    if (nodeHasImageFill(n)) return false;
-    if (SVG_LEAF_TYPES.has(n.type) && !("children" in n)) return true;
-    if ("children" in n) {
-      const children = (n as FrameNode & { children: readonly SceneNode[] }).children;
-      if (children.length === 0) return false;
-      if (!SVG_CONTAINER_TYPES.has(n.type) && !SVG_LEAF_TYPES.has(n.type)) return false;
-      return children.every((c) => isAllSvg(c));
+  let rb: { x: number; y: number; width: number; height: number } | null = null;
+  try {
+    if ("absoluteRenderBounds" in node) {
+      rb = (node as FrameNode).absoluteRenderBounds;
     }
-    return false;
+  } catch {
+    rb = null;
+  }
+  if (!rb || rb.width <= 0 || rb.height <= 0) return false;
+
+  let complexCount = 0;
+  let primitiveCount = 0;
+  function tally(n: SceneNode) {
+    if (n.visible === false) return;
+    if (SVG_COMPLEX_PRIMITIVES.has(n.type)) {
+      complexCount++;
+      primitiveCount++;
+      // Short-circuit possible once we know it's worth it; complex primitives
+      // always qualify on their own.
+      return;
+    }
+    if (SVG_SIMPLE_PRIMITIVES.has(n.type)) primitiveCount++;
+    if ("children" in n) {
+      for (const c of (n as FrameNode & { children: readonly SceneNode[] }).children) {
+        tally(c);
+        if (complexCount > 0) return;
+      }
+    }
+  }
+  tally(node);
+
+  return complexCount > 0 || primitiveCount >= 2;
+}
+
+/**
+ * Walk a subtree once and return the topmost "all-SVG" nodes — nodes
+ * whose entire subtree is vector-only and whose parent is NOT also all-SVG.
+ * These are the nodes worth rendering as standalone SVG files; rendering
+ * inner nodes too would duplicate content.
+ *
+ * Returns node references (not just IDs) so the caller doesn't have to do a
+ * `figma.getNodeByIdAsync()` round-trip per icon — on a page with 200+ icons
+ * that single change shaves seconds off the export.
+ *
+ * Implementation note: this is a single bottom-up traversal. The previous
+ * approach called `isAllSvg` at every node, which itself recursed the whole
+ * subtree — quadratic blow-up on large mixed-content pages (a non-vector
+ * frame with 10k descendants did ~50M extra visits). We now compute the
+ * boolean per node in one pass and select roots in a second linear pass.
+ */
+function collectSvgRoots(node: SceneNode): { roots: SceneNode[]; candidates: number } {
+  const allSvg = new Map<string, boolean>();
+
+  function computeAllSvg(n: SceneNode): boolean {
+    const cached = allSvg.get(n.id);
+    if (cached !== undefined) return cached;
+
+    let result: boolean;
+    if (nodeHasImageFill(n)) {
+      result = false;
+    } else if ("children" in n) {
+      const children = (n as FrameNode & { children: readonly SceneNode[] }).children;
+      if (children.length === 0) {
+        result = false;
+      } else if (!SVG_CONTAINER_TYPES.has(n.type) && !SVG_LEAF_TYPES.has(n.type)) {
+        result = false;
+        // Still need to evaluate descendants — they may contain their own roots.
+        for (const c of children) computeAllSvg(c);
+      } else {
+        let all = true;
+        for (const c of children) {
+          if (!computeAllSvg(c)) all = false;
+        }
+        result = all;
+      }
+    } else if (SVG_LEAF_TYPES.has(n.type)) {
+      result = true;
+    } else {
+      result = false;
+    }
+
+    allSvg.set(n.id, result);
+    return result;
   }
 
-  function walk(n: SceneNode, parentIsAllSvg: boolean) {
-    const selfAllSvg = isAllSvg(n);
-    if (selfAllSvg && !parentIsAllSvg) {
-      roots.add(n.id);
+  const roots: SceneNode[] = [];
+  let candidates = 0;
+  function selectRoots(n: SceneNode, parentIsAllSvg: boolean) {
+    const self = allSvg.get(n.id) === true;
+    if (self && !parentIsAllSvg) {
+      candidates++;
+      // Only materialize this as an export target if it's actually worth
+      // sending through exportAsync. Without this filter, every hidden node,
+      // empty rect, and 1px separator becomes a round-trip to the renderer.
+      if (isSvgWorthExporting(n)) roots.push(n);
     }
-    if ("children" in n && !selfAllSvg) {
-      // Only recurse into non-all-SVG containers; otherwise we'd pick up
-      // already-covered descendants.
+    if ("children" in n && !self) {
       for (const child of (n as FrameNode & { children: readonly SceneNode[] }).children) {
-        walk(child, selfAllSvg);
+        selectRoots(child, false);
       }
     }
   }
 
-  walk(node, false);
-  return roots;
+  computeAllSvg(node);
+  selectRoots(node, false);
+  return { roots, candidates };
+}
+
+/**
+ * Bounded-concurrency parallel map. Figma's `exportAsync` and `getBytesAsync`
+ * are fulfilled by the host renderer, which can serve several in-flight
+ * requests at once. Running them strictly sequentially leaves throughput on
+ * the floor — a 200-icon SVG export went from ~30s sequential to ~5s with
+ * concurrency=6. Cap is conservative: too high risks backpressure / OOM in
+ * the host process for very large vectors.
+ *
+ * Cancellation is checked between scheduled items so the user can still bail
+ * out mid-batch.
+ */
+async function parallelMap<T, R>(
+  items: readonly T[],
+  concurrency: number,
+  fn: (item: T, index: number) => Promise<R>,
+): Promise<R[]> {
+  if (items.length === 0) return [];
+  const results: R[] = new Array(items.length);
+  let nextIndex = 0;
+  const workerCount = Math.min(Math.max(1, concurrency), items.length);
+  async function worker(): Promise<void> {
+    while (true) {
+      const i = nextIndex++;
+      if (i >= items.length) return;
+      checkCancelled();
+      results[i] = await fn(items[i], i);
+    }
+  }
+  await Promise.all(Array.from({ length: workerCount }, () => worker()));
+  return results;
 }
 
 // ── Node Serializer ──────────────────────────────────────────────────────────
@@ -244,6 +425,11 @@ type ProgressTracker = {
   callback: (serialized: number, total: number, nodeName: string) => void;
   serialized: number;
   total: number;
+  // Last `nodeName` actually flushed to the UI. Progress callbacks are
+  // throttled to keep postMessage off the per-node hot path; this lets us
+  // skip redundant posts when neither the percent bucket nor the name moved.
+  lastReportedPercent: number;
+  lastReportedAt: number;
 };
 
 type SerializedNode = Record<string, unknown>;
@@ -254,7 +440,214 @@ type SerializeOpts = {
   progress?: ProgressTracker;
   // Image refs (hashes) to fetch bytes for after serialization
   imageRefs: Set<string>;
+  // Memoizes `inst.getMainComponentAsync()` by node id. Without this, every
+  // INSTANCE pays the async host round-trip twice (here + in
+  // collectCrossScopeComponents), which compounds badly on pages with
+  // hundreds of instances.
+  mainComponentCache: Map<string, ComponentNode | null>;
+  // Collects info about every node whose serialization threw. An error in
+  // one subtree no longer aborts the whole export — the broken node is
+  // replaced with an error stub and its siblings continue. The plugin
+  // surfaces the count + summary in the success message so designers know
+  // exactly what didn't make it into the export.
+  errors: BrokenNodeRecord[];
 };
+
+type BrokenNodeRecord = {
+  id: string;
+  name: string;
+  type: string;
+  path: string;
+  message: string;
+};
+
+// ── Broken-component-set diagnostics ─────────────────────────────────────────
+
+/**
+ * Pull every byte of context we can from a node that just blew up inside the
+ * Figma API. The raw error ("Component set for node has existing errors")
+ * tells you nothing about *which* component set, *where* in the tree, or
+ * *which* of the related getters are broken. This probes each one in
+ * isolation so the warning identifies the offender precisely.
+ *
+ * Each probe is wrapped individually because they fail independently: e.g.
+ * `componentProperties` can throw while `variantProperties` (the legacy API)
+ * still works. The combination of which probes throw is itself diagnostic
+ * — it tells you whether the issue is property-definition shape, variant
+ * combinatorics, or a missing remote component.
+ */
+function nodeAncestorPath(node: BaseNode): string {
+  const parts: string[] = [];
+  let cur: BaseNode | null = node;
+  // Cap depth — Figma trees are deep but a runaway loop here would hide the
+  // real error we're trying to surface.
+  let safety = 50;
+  while (cur && safety-- > 0) {
+    parts.unshift(`${cur.name} [${cur.type}${cur.id ? ` ${cur.id}` : ""}]`);
+    try {
+      cur = cur.parent;
+    } catch {
+      cur = null;
+    }
+  }
+  return parts.join(" › ");
+}
+
+async function describeBrokenInstance(
+  inst: InstanceNode,
+  originalError: unknown,
+  failedProbe: string,
+): Promise<void> {
+  const report: Record<string, unknown> = {
+    failedProbe,
+    nodeId: inst.id,
+    nodeName: inst.name,
+    nodeType: inst.type,
+    path: nodeAncestorPath(inst),
+  };
+
+  try {
+    const bb = (inst as InstanceNode).absoluteBoundingBox;
+    if (bb) report.position = { x: bb.x, y: bb.y, width: bb.width, height: bb.height };
+  } catch (e) {
+    report.positionError = String(e);
+  }
+
+  // Legacy variant API — usually still works when the new property API throws,
+  // and tells you exactly which variant combination this instance refers to.
+  try {
+    const variants = (inst as InstanceNode).variantProperties;
+    if (variants) report.variantProperties = variants;
+  } catch (e) {
+    report.variantPropertiesError = String(e);
+  }
+
+  // Probe componentProperties separately — if this one is the one that
+  // threw, calling it again will throw again, which is fine: we capture it.
+  try {
+    const props = inst.componentProperties;
+    if (props) report.componentPropertiesKeys = Object.keys(props);
+  } catch (e) {
+    report.componentPropertiesError = e instanceof Error ? e.message : String(e);
+  }
+
+  // Probe overrides count — useful signal for "how customized is this instance"
+  try {
+    const overrides = (inst as InstanceNode).overrides;
+    if (overrides) report.overrideCount = overrides.length;
+  } catch (e) {
+    report.overridesError = String(e);
+  }
+
+  // Main component lookup — async, may throw.
+  let main: ComponentNode | null = null;
+  try {
+    main = await inst.getMainComponentAsync();
+    if (main) {
+      report.mainComponent = {
+        id: main.id,
+        name: main.name,
+        key: main.key,
+        remote: main.remote,
+      };
+      // Component set parent
+      try {
+        const parent = main.parent;
+        if (parent && parent.type === "COMPONENT_SET") {
+          const cs = parent as ComponentSetNode;
+          const setInfo: Record<string, unknown> = {
+            id: cs.id,
+            name: cs.name,
+            key: cs.key,
+            remote: cs.remote,
+            path: nodeAncestorPath(cs),
+          };
+          try {
+            // This is the most common throw site — wrap and capture.
+            const defs = cs.componentPropertyDefinitions;
+            if (defs) setInfo.propertyDefinitionKeys = Object.keys(defs);
+          } catch (e) {
+            setInfo.componentPropertyDefinitionsError =
+              e instanceof Error ? e.message : String(e);
+          }
+          try {
+            setInfo.variantCount = cs.children.length;
+          } catch (e) {
+            setInfo.variantCountError = String(e);
+          }
+          report.componentSet = setInfo;
+        }
+      } catch (e) {
+        report.mainComponentParentError = String(e);
+      }
+    } else {
+      report.mainComponent = null;
+    }
+  } catch (e) {
+    report.getMainComponentError = e instanceof Error ? e.message : String(e);
+  }
+
+  report.originalError = originalError instanceof Error
+    ? { message: originalError.message, stack: originalError.stack }
+    : String(originalError);
+
+  warn(`broken instance detected:\n${JSON.stringify(report, null, 2)}`);
+}
+
+/**
+ * Generic fallback for any node (not just INSTANCE) whose serialization
+ * threw something we didn't anticipate. Pulls whatever metadata is safe to
+ * read so the designer can locate the offender, then returns a minimal stub
+ * that takes the broken node's place in the parent's children array.
+ *
+ * The stub keeps `id` / `name` / `type` so downstream consumers can still
+ * reference it, and adds a `__framelinkError` marker so AI agents can
+ * distinguish a real node from one that failed to export.
+ */
+function describeBrokenNode(node: SceneNode, err: unknown): BrokenNodeRecord {
+  const record: BrokenNodeRecord = {
+    id: node.id,
+    name: node.name,
+    type: node.type,
+    path: nodeAncestorPath(node),
+    message: err instanceof Error ? err.message : String(err),
+  };
+  const detail: Record<string, unknown> = { ...record };
+  try {
+    const bb = (node as FrameNode).absoluteBoundingBox;
+    if (bb) detail.position = { x: bb.x, y: bb.y, width: bb.width, height: bb.height };
+  } catch {
+    // ignore — we did our best
+  }
+  if (err instanceof Error && err.stack) detail.stack = err.stack;
+  warn(`broken node detected:\n${JSON.stringify(detail, null, 2)}`);
+  return record;
+}
+
+function makeErrorStub(node: SceneNode, err: unknown): SerializedNode {
+  const stub: SerializedNode = {
+    id: node.id,
+    name: node.name,
+    type: node.type,
+    __framelinkError: err instanceof Error ? err.message : String(err),
+  };
+  // Best-effort position so layout-aware consumers can still place a
+  // placeholder where the broken node lived.
+  try {
+    const bb = (node as FrameNode).absoluteBoundingBox;
+    if (bb) stub.absoluteBoundingBox = { x: bb.x, y: bb.y, width: bb.width, height: bb.height };
+  } catch {
+    // ignore
+  }
+  try {
+    if ("width" in node) {
+      stub.size = { x: (node as FrameNode).width, y: (node as FrameNode).height };
+    }
+  } catch {
+    // ignore
+  }
+  return stub;
+}
 
 async function serializeNode(node: SceneNode, opts: SerializeOpts): Promise<SerializedNode> {
   const result: SerializedNode = {
@@ -437,24 +830,52 @@ async function serializeNode(node: SceneNode, opts: SerializeOpts): Promise<Seri
         result.characterStyleOverrides = characterStyleOverrides;
         result.styleOverrideTable = overrides;
       }
-    } catch {
+    } catch (e) {
       // getStyledTextSegments may fail on some text nodes — non-critical
+      warn(`getStyledTextSegments failed for text node ${node.id} (${node.name}):`, e);
     }
   }
 
   if (node.type === "COMPONENT" || node.type === "COMPONENT_SET") {
     const comp = node as ComponentNode | ComponentSetNode;
-    if (comp.componentPropertyDefinitions) {
-      result.componentPropertyDefinitions = comp.componentPropertyDefinitions;
+    // `componentPropertyDefinitions` throws if the component set has invariant
+    // errors (broken variants, missing remote library, malformed property
+    // definitions). One bad node would otherwise kill the entire export.
+    try {
+      const defs = comp.componentPropertyDefinitions;
+      if (defs) result.componentPropertyDefinitions = defs;
+    } catch (e) {
+      warn(
+        `componentPropertyDefinitions threw on ${node.type} ${node.id} (${node.name}) at ${nodeAncestorPath(node)} — underlying error:`,
+        e,
+      );
     }
   }
 
   if (node.type === "INSTANCE") {
     const inst = node as InstanceNode;
-    if (inst.componentProperties) {
-      result.componentProperties = inst.componentProperties;
+    // `componentProperties` throws with "Component set for node has existing
+    // errors" if the instance's component set is broken. Defer to the rich
+    // diagnostic helper so the warning identifies *which* part is broken.
+    try {
+      const props = inst.componentProperties;
+      if (props) result.componentProperties = props;
+    } catch (e) {
+      await describeBrokenInstance(inst, e, "componentProperties");
     }
-    const mainComp = await inst.getMainComponentAsync();
+    const cached = opts.mainComponentCache.get(inst.id);
+    let mainComp: ComponentNode | null;
+    if (cached !== undefined) {
+      mainComp = cached;
+    } else {
+      try {
+        mainComp = await inst.getMainComponentAsync();
+      } catch (e) {
+        await describeBrokenInstance(inst, e, "getMainComponentAsync");
+        mainComp = null;
+      }
+      opts.mainComponentCache.set(inst.id, mainComp);
+    }
     if (mainComp) {
       result.componentId = mainComp.id;
     }
@@ -467,20 +888,46 @@ async function serializeNode(node: SceneNode, opts: SerializeOpts): Promise<Seri
     } else {
       const childResults: SerializedNode[] = [];
       for (const child of container.children) {
-        childResults.push(
-          await serializeNode(child, { ...opts, currentDepth: opts.currentDepth + 1 }),
-        );
+        try {
+          childResults.push(
+            await serializeNode(child, { ...opts, currentDepth: opts.currentDepth + 1 }),
+          );
+        } catch (e) {
+          // Cancellation must propagate — it's a user action, not a data bug.
+          if (e instanceof ExportCancelled) throw e;
+          // Any other throw: log it, record it, drop in an error stub so the
+          // parent still has structurally valid children, and keep going so
+          // sibling subtrees aren't lost.
+          opts.errors.push(describeBrokenNode(child, e));
+          childResults.push(makeErrorStub(child, e));
+        }
       }
       result.children = childResults;
     }
   }
 
   if (opts.progress) {
-    opts.progress.serialized++;
-    opts.progress.callback(opts.progress.serialized, opts.progress.total, node.name);
+    const p = opts.progress;
+    p.serialized++;
+    // Throttle: only post when the integer-percent bucket changes OR 100ms
+    // has elapsed since the last post. Posting per node turned the UI thread
+    // into the bottleneck on big trees (each postMessage = structured-clone
+    // across the sandbox boundary).
+    const pct = p.total > 0 ? Math.floor((p.serialized / p.total) * 100) : 0;
+    const now = Date.now();
+    if (
+      pct !== p.lastReportedPercent ||
+      now - p.lastReportedAt >= 100 ||
+      p.serialized === p.total
+    ) {
+      p.lastReportedPercent = pct;
+      p.lastReportedAt = now;
+      p.callback(p.serialized, p.total, node.name);
+    }
   }
 
-  await yieldAndCheckCancel();
+  const pending = maybeYield();
+  if (pending) await pending;
 
   return result;
 }
@@ -539,26 +986,46 @@ function collectComponents(
  * the current export scope, and add the missing component metadata so the
  * extractor's component lookup resolves cleanly. Without this, agents see
  * `componentId: <id>` references with no matching definition.
+ *
+ * Reads `mainComponentCache` populated during serialization so we don't pay
+ * the async `getMainComponentAsync()` round-trip a second time per instance.
  */
 async function collectCrossScopeComponents(
   node: SceneNode,
   components: Record<string, ComponentMeta>,
   componentSets: Record<string, ComponentSetMeta>,
+  mainComponentCache: Map<string, ComponentNode | null>,
 ): Promise<void> {
   if (node.type === "INSTANCE") {
     const inst = node as InstanceNode;
-    const main = await inst.getMainComponentAsync();
+    let main: ComponentNode | null | undefined = mainComponentCache.get(inst.id);
+    if (main === undefined) {
+      try {
+        main = await inst.getMainComponentAsync();
+      } catch (e) {
+        await describeBrokenInstance(inst, e, "collectCrossScopeComponents.getMainComponentAsync");
+        main = null;
+      }
+      mainComponentCache.set(inst.id, main);
+    }
     if (main && !components[main.id]) {
       const meta: ComponentMeta = {
         key: main.key,
         name: main.name,
         description: main.description,
       };
-      if (main.parent && main.parent.type === "COMPONENT_SET") {
-        meta.componentSetId = main.parent.id;
-        if (!componentSets[main.parent.id]) {
-          const cs = main.parent as ComponentSetNode;
-          componentSets[main.parent.id] = {
+      // `main.parent` access can also throw on broken component sets.
+      let parent: BaseNode | null = null;
+      try {
+        parent = main.parent;
+      } catch (e) {
+        warn(`collectCrossScopeComponents: reading parent threw for component ${main.id} (${main.name}); skipping parent set. Underlying error:`, e);
+      }
+      if (parent && parent.type === "COMPONENT_SET") {
+        meta.componentSetId = parent.id;
+        if (!componentSets[parent.id]) {
+          const cs = parent as ComponentSetNode;
+          componentSets[parent.id] = {
             key: cs.key,
             name: cs.name,
             description: cs.description,
@@ -570,7 +1037,7 @@ async function collectCrossScopeComponents(
   }
   if ("children" in node) {
     for (const child of (node as FrameNode & { children: readonly SceneNode[] }).children) {
-      await collectCrossScopeComponents(child, components, componentSets);
+      await collectCrossScopeComponents(child, components, componentSets, mainComponentCache);
     }
   }
 }
@@ -641,7 +1108,8 @@ async function exportNodeAsPng(node: SceneNode): Promise<Uint8Array | null> {
       format: "PNG",
       constraint: { type: "SCALE", value: FRAME_IMAGE_SCALE },
     });
-  } catch {
+  } catch (e) {
+    warn(`PNG export failed for ${node.id} (${node.name}):`, e);
     return null;
   }
 }
@@ -649,7 +1117,8 @@ async function exportNodeAsPng(node: SceneNode): Promise<Uint8Array | null> {
 async function exportNodeAsSvg(node: SceneNode): Promise<string | null> {
   try {
     return await node.exportAsync({ format: "SVG_STRING" });
-  } catch {
+  } catch (e) {
+    warn(`SVG export failed for ${node.id} (${node.name}):`, e);
     return null;
   }
 }
@@ -703,10 +1172,24 @@ async function collectAssets(opts: AssetOptions): Promise<AssetCollectionResult>
 
   // 1. Top-level frame screenshots — what the agent uses for visual grounding.
   if (opts.exportFrameImages) {
-    for (const node of opts.topLevelNodes) {
-      opts.onProgress(`Rendering ${node.name} (PNG)`);
+    const phaseStart = now();
+    log(`assets/png: rendering ${opts.topLevelNodes.length} top-level node(s)…`);
+    opts.onProgress(`Rendering ${opts.topLevelNodes.length} top-level PNG(s)…`);
+    let pngOk = 0;
+    let pngFail = 0;
+    let pngBytes = 0;
+    // Top-level frames are heavier than icons; cap concurrency lower so we
+    // don't OOM the host on giant @2x renders.
+    const results = await parallelMap(opts.topLevelNodes, 3, async (node) => {
+      const nodeStart = now();
       const bytes = await exportNodeAsPng(node);
+      return { node, bytes, took: ms(nodeStart) };
+    });
+    for (const { node, bytes, took } of results) {
       if (bytes) {
+        pngOk++;
+        pngBytes += bytes.length;
+        log(`  PNG ok: ${node.name} (${node.id}) — ${(bytes.length / 1024).toFixed(1)} KB in ${took}`);
         const filename = `node_${safeIdForFilename(node.id)}.png`;
         assets.push({ path: filename, bytes, mime: "image/png" });
         manifest[node.id] = {
@@ -714,50 +1197,121 @@ async function collectAssets(opts: AssetOptions): Promise<AssetCollectionResult>
           image: `${folder}/${filename}`,
           imageScale: FRAME_IMAGE_SCALE,
         };
+      } else {
+        pngFail++;
       }
-      await yieldAndCheckCancel();
     }
+    log(`assets/png: done (${pngOk} ok, ${pngFail} failed, ${(pngBytes / 1024 / 1024).toFixed(2)} MB) in ${ms(phaseStart)}`);
   }
 
   // 2. SVG exports for vector subtrees — closes the IMAGE-SVG dead-end.
   if (opts.exportSvgs) {
-    const svgRoots = new Set<string>();
+    const phaseStart = now();
+    const detectStart = now();
+    // Dedupe by node id across multiple top-level nodes (rare for selection,
+    // common for page scope where overlapping subtrees can surface the same
+    // root twice).
+    const seen = new Set<string>();
+    const svgNodes: SceneNode[] = [];
+    let totalCandidates = 0;
     for (const top of opts.topLevelNodes) {
-      for (const id of collectSvgRoots(top)) svgRoots.add(id);
+      const { roots: topRoots, candidates } = collectSvgRoots(top);
+      totalCandidates += candidates;
+      for (const n of topRoots) {
+        if (!seen.has(n.id)) {
+          seen.add(n.id);
+          svgNodes.push(n);
+        }
+      }
     }
-    for (const id of svgRoots) {
-      const node = await figma.getNodeByIdAsync(id);
-      if (!node || !("exportAsync" in node)) continue;
-      opts.onProgress(`Rendering ${(node as SceneNode).name} (SVG)`);
-      const svg = await exportNodeAsSvg(node as SceneNode);
+    const filtered = totalCandidates - svgNodes.length;
+    log(
+      `assets/svg: ${svgNodes.length} worth exporting ` +
+      `(filtered out ${filtered} of ${totalCandidates} candidates: invisible / zero-area / single-trivial-primitive) ` +
+      `in ${ms(detectStart)}`,
+    );
+    let svgOk = 0;
+    let svgFail = 0;
+    let svgBytes = 0;
+    let svgDone = 0;
+    // SVG export is the long pole on icon-heavy designs. Each call is a
+    // round-trip to the host renderer; sequential awaits left ~80% of host
+    // throughput unused. concurrency=6 is a sweet spot in measurement —
+    // higher values stop helping once the host is saturated and just add
+    // memory pressure for the queued promises.
+    const results = await parallelMap(svgNodes, 6, async (node) => {
+      const nodeStart = now();
+      const svg = await exportNodeAsSvg(node);
+      svgDone++;
+      // Throttled progress: only every ~25 to keep postMessage cheap.
+      if (svgDone % 25 === 0 || svgDone === svgNodes.length) {
+        opts.onProgress(`Rendering SVG ${svgDone}/${svgNodes.length}…`);
+      }
+      return { node, svg, took: ms(nodeStart) };
+    });
+    for (const { node, svg, took } of results) {
       if (svg) {
-        const filename = `icon_${safeIdForFilename(id)}.svg`;
+        svgOk++;
+        svgBytes += svg.length;
+        // Only log per-icon detail at high verbosity to avoid spamming for
+        // hundreds of icons. Slow ones (>200ms) always get logged.
+        const tookMs = parseFloat(took);
+        if (DEBUG && tookMs > 200) {
+          log(`  SVG slow: ${node.name} (${node.id}) — ${svg.length} chars in ${took}`);
+        }
+        const filename = `icon_${safeIdForFilename(node.id)}.svg`;
         assets.push({ path: filename, bytes: utf8Encode(svg), mime: "image/svg+xml" });
-        manifest[id] = {
-          ...(manifest[id] ?? {}),
+        manifest[node.id] = {
+          ...(manifest[node.id] ?? {}),
           svg: `${folder}/${filename}`,
         };
+      } else {
+        svgFail++;
       }
-      await yieldAndCheckCancel();
     }
+    log(`assets/svg: done (${svgOk} ok, ${svgFail} failed, ${(svgBytes / 1024 / 1024).toFixed(2)} MB) in ${ms(phaseStart)}`);
   }
 
   // 3. Image-fill bytes (raster fills referenced by imageRef hash).
   if (opts.exportImageFills) {
-    for (const ref of opts.imageRefs) {
-      opts.onProgress(`Fetching image fill ${ref.slice(0, 8)}…`);
+    const phaseStart = now();
+    log(`assets/imageFills: fetching ${opts.imageRefs.size} image fill(s)…`);
+    opts.onProgress(`Fetching ${opts.imageRefs.size} image fill(s)…`);
+    let fillOk = 0;
+    let fillSkip = 0;
+    let fillFail = 0;
+    let fillBytes = 0;
+    const refs = Array.from(opts.imageRefs);
+    type FillResult =
+      | { kind: "ok"; ref: string; bytes: Uint8Array }
+      | { kind: "skip"; ref: string }
+      | { kind: "fail"; ref: string; err: unknown };
+    const results = await parallelMap<string, FillResult>(refs, 6, async (ref): Promise<FillResult> => {
       try {
         const image = figma.getImageByHash(ref);
-        if (!image) continue;
+        if (!image) return { kind: "skip", ref };
         const bytes = await image.getBytesAsync();
-        const filename = `image_${ref}.png`;
-        assets.push({ path: filename, bytes, mime: "image/png" });
-        imageFills[ref] = `${folder}/${filename}`;
-      } catch {
-        // Skip — image bytes may be unavailable for some refs (e.g. removed)
+        return { kind: "ok", ref, bytes };
+      } catch (e) {
+        return { kind: "fail", ref, err: e };
       }
-      await yieldAndCheckCancel();
+    });
+    for (const r of results) {
+      if (r.kind === "ok") {
+        fillOk++;
+        fillBytes += r.bytes.length;
+        const filename = `image_${r.ref}.png`;
+        assets.push({ path: filename, bytes: r.bytes, mime: "image/png" });
+        imageFills[r.ref] = `${folder}/${filename}`;
+      } else if (r.kind === "skip") {
+        fillSkip++;
+        warn(`assets/imageFills: no image for ref ${r.ref}`);
+      } else {
+        fillFail++;
+        warn(`assets/imageFills: failed to fetch bytes for ref ${r.ref}:`, r.err);
+      }
     }
+    log(`assets/imageFills: done (${fillOk} ok, ${fillSkip} skipped, ${fillFail} failed, ${(fillBytes / 1024 / 1024).toFixed(2)} MB) in ${ms(phaseStart)}`);
   }
 
   return { assets, manifest, imageFills, assetsFolder: folder };
@@ -802,6 +1356,7 @@ type ExportResult = {
   assets: AssetEntry[];
   nodeCount: number;
   assetsFolder: string;
+  errors: BrokenNodeRecord[];
 };
 
 async function performExport(input: ExportInput): Promise<ExportResult> {
@@ -811,36 +1366,90 @@ async function performExport(input: ExportInput): Promise<ExportResult> {
     throw new Error("No nodes selected. Select at least one node in Figma.");
   }
 
+  const exportStart = now();
+  log(`=== Export start ===`);
+  log(`scope=${scope}, depth=${depth ?? "unlimited"}, rootNodes=${nodes.length}, fileName=${jsonFileName}`);
+  log(`options: frameImages=${input.exportFrameImages}, svgs=${input.exportSvgs}, imageFills=${input.exportImageFills}`);
+
+  resetYieldCounter();
+
+  const countStart = now();
   const totalNodes = nodes.reduce((acc, n) => acc + countNodes(n, 0, depth), 0);
+  log(`countNodes: ${totalNodes} node(s) to serialize — ${ms(countStart)}`);
+
   const progress: ProgressTracker = {
     callback: (current, total, nodeName) => {
       figma.ui.postMessage({ type: "export-progress", current, total, nodeName });
     },
     serialized: 0,
     total: totalNodes,
+    lastReportedPercent: -1,
+    lastReportedAt: 0,
   };
 
   const components: Record<string, ComponentMeta> = {};
   const componentSets: Record<string, ComponentSetMeta> = {};
+  const collectCompStart = now();
   for (const n of nodes) collectComponents(n, components, componentSets);
-  for (const n of nodes) await collectCrossScopeComponents(n, components, componentSets);
+  log(`collectComponents: ${Object.keys(components).length} component(s), ${Object.keys(componentSets).length} set(s) — ${ms(collectCompStart)}`);
 
+  const stylesStart = now();
   const styles = await collectStyles();
+  log(`collectStyles: ${Object.keys(styles).length} style(s) — ${ms(stylesStart)}`);
+
+  // Shared cache: populated by serializeNode and reused by
+  // collectCrossScopeComponents so each INSTANCE pays the async
+  // getMainComponentAsync() round-trip at most once.
+  const mainComponentCache = new Map<string, ComponentNode | null>();
 
   const imageRefs = new Set<string>();
+  const serializeErrors: BrokenNodeRecord[] = [];
   const serializeOpts: SerializeOpts = {
     currentDepth: 0,
     maxDepth: depth,
     progress,
     imageRefs,
+    mainComponentCache,
+    errors: serializeErrors,
   };
 
+  const serializeStart = now();
+  log(`serialize: starting walk over ${totalNodes} node(s)…`);
   const serializedNodes: SerializedNode[] = [];
   for (const node of nodes) {
-    serializedNodes.push(await serializeNode(node, serializeOpts));
+    try {
+      serializedNodes.push(await serializeNode(node, serializeOpts));
+    } catch (e) {
+      if (e instanceof ExportCancelled) throw e;
+      // Even a top-level root failing shouldn't kill the export of the
+      // other roots in a multi-selection. Same error-stub strategy as
+      // child nodes.
+      serializeErrors.push(describeBrokenNode(node, e));
+      serializedNodes.push(makeErrorStub(node, e));
+    }
+  }
+  log(
+    `serialize: done in ${ms(serializeStart)} ` +
+    `(${imageRefs.size} image-fill ref(s), ${mainComponentCache.size} instance(s) cached, ` +
+    `${serializeErrors.length} node(s) failed to serialize)`,
+  );
+  if (serializeErrors.length > 0) {
+    warn(`serialize: ${serializeErrors.length} node(s) replaced with error stubs. Summary:`);
+    for (const r of serializeErrors) {
+      warn(`  - ${r.type} ${r.id} (${r.name}) at ${r.path} — ${r.message}`);
+    }
   }
 
+  const crossScopeStart = now();
+  const beforeCount = Object.keys(components).length;
+  for (const n of nodes) {
+    await collectCrossScopeComponents(n, components, componentSets, mainComponentCache);
+  }
+  const added = Object.keys(components).length - beforeCount;
+  log(`collectCrossScopeComponents: +${added} external component(s) — ${ms(crossScopeStart)}`);
+
   const assetsFolder = deriveAssetsFolder(jsonFileName);
+  const assetsStart = now();
   const assetResult = await collectAssets({
     exportFrameImages: input.exportFrameImages,
     exportSvgs: input.exportSvgs,
@@ -852,6 +1461,8 @@ async function performExport(input: ExportInput): Promise<ExportResult> {
       figma.ui.postMessage({ type: "export-progress-asset", label });
     },
   });
+  const totalAssetBytes = assetResult.assets.reduce((acc, a) => acc + a.bytes.length, 0);
+  log(`collectAssets: ${assetResult.assets.length} asset(s), ${(totalAssetBytes / 1024 / 1024).toFixed(2)} MB total — ${ms(assetsStart)}`);
 
   // Build framelinkExport metadata block — single source of truth for asset
   // resolution on the MCP side. Lives at the JSON root.
@@ -872,6 +1483,11 @@ async function performExport(input: ExportInput): Promise<ExportResult> {
       exportSvgs: input.exportSvgs,
       exportImageFills: input.exportImageFills,
     },
+    // Nodes that threw during serialization — replaced with error stubs in
+    // the tree, but enumerated here so downstream consumers can flag them
+    // (e.g. an MCP tool could refuse to generate code for these or surface
+    // a warning to the user).
+    errors: serializeErrors,
   };
 
   let response: Record<string, unknown>;
@@ -916,11 +1532,16 @@ async function performExport(input: ExportInput): Promise<ExportResult> {
     };
   }
 
+  const stringifyStart = now();
+  const jsonString = JSON.stringify(response, null, 2);
+  log(`JSON.stringify: ${(jsonString.length / 1024 / 1024).toFixed(2)} MB — ${ms(stringifyStart)}`);
+  log(`=== Export complete in ${ms(exportStart)} (${serializeErrors.length} broken node(s) skipped) ===`);
   return {
-    json: JSON.stringify(response, null, 2),
+    json: jsonString,
     assets: assetResult.assets,
     nodeCount: nodes.length,
     assetsFolder,
+    errors: serializeErrors,
   };
 }
 
@@ -972,6 +1593,7 @@ const ALLOWED_OPEN_URL_PREFIXES = [
 
 figma.ui.onmessage = async (msg: UIMessage) => {
   if (msg.type === "cancel-export") {
+    log("cancel-export received from UI");
     cancelled = true;
     return;
   }
@@ -1035,16 +1657,24 @@ figma.ui.onmessage = async (msg: UIMessage) => {
       assetsFolder: result.assetsFolder,
       fileName,
       nodeCount: result.nodeCount,
+      // UI surfaces these as a sub-warning on the success toast so the user
+      // knows part of the export was best-effort and can audit the JSON's
+      // `framelinkExport.errors` block for details.
+      errorCount: result.errors.length,
+      errorSummaries: result.errors.slice(0, 5).map((e) => `${e.type} ${e.id} (${e.name})`),
     });
-  } catch (error) {
-    if (error instanceof ExportCancelled) {
+    log(`posted export-result to UI (${result.assets.length} asset(s), json ${(result.json.length / 1024 / 1024).toFixed(2)} MB, ${result.errors.length} skipped node(s))`);
+  } catch (err) {
+    if (err instanceof ExportCancelled) {
+      log("export was cancelled");
       figma.ui.postMessage({ type: "export-cancelled" });
       return;
     }
+    error("export failed:", err, err instanceof Error ? err.stack : undefined);
     figma.ui.postMessage({
       type: "export-result",
       success: false,
-      error: error instanceof Error ? error.message : String(error),
+      error: err instanceof Error ? err.message : String(err),
     });
   }
 };

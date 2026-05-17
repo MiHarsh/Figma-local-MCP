@@ -99,8 +99,8 @@ A top-level `framelinkExport` block carries metadata + the asset manifest:
 ```jsonc
 {
   "framelinkExport": {
-    "pluginVersion": "1.2.0",
-    "exportedAt": "2026-05-16T...",
+    "pluginVersion": "1.3.0",
+    "exportedAt": "2026-05-17T...",
     "scope": "selection",
     "depth": null,
     "fileName": "MyDesignFile",
@@ -115,10 +115,21 @@ A top-level `framelinkExport` block carries metadata + the asset manifest:
     "imageFills": {
       "abc123...": "design.assets/image_abc123.png"
     },
+    "errors": [
+      {
+        "id": "3821:98370",
+        "name": "Copilot Drawer",
+        "type": "INSTANCE",
+        "path": "Page 1 › Frame 12 › Copilot Drawer",
+        "message": "componentProperties getter threw: Component set for node has existing errors"
+      }
+    ],
     "options": { "exportFrameImages": true, "exportSvgs": true, "exportImageFills": true }
   }
 }
 ```
+
+The `errors` array (added in 1.3.0) lists nodes that were replaced by lightweight stubs because a Figma API call threw on them — most commonly broken remote library component sets. The export as a whole still succeeds; only the broken subtree is skipped. The MCP server surfaces these so the agent knows what's missing.
 
 The MCP server reads this block and:
 - stamps `imagePath` / `svgPath` / `renderHint` onto matching nodes in the simplified output
@@ -133,6 +144,42 @@ npm run watch   # Rebuild on file changes
 ```
 
 After editing, reload the plugin in Figma (right-click in the plugin menu → **Run last plugin** or re-open it).
+
+## Release notes
+
+### 1.3.0 — performance & resilience
+
+**Performance**
+
+- **Smart SVG candidate filtering.** Vector-only subtrees are pre-filtered before `exportAsync` using `absoluteRenderBounds` + a complex-vs-simple primitive classifier. Files that previously sent 1200+ candidate nodes to the renderer (mostly invisible / zero-area / single trivial shapes) now send only the ~20 that produce real SVG output. Asset phase is ~50× faster on icon-heavy files.
+- **Parallel asset exports.** PNG renders (concurrency 3), SVG renders (6), and image-fill byte fetches (6) now run through a bounded worker pool instead of sequentially.
+- **O(n) SVG root detection.** Replaced a quadratic upward-walk with a single bottom-up pass; dropped a redundant `getNodeByIdAsync` round-trip per icon.
+- **Yield throttling.** Tree serialization yields to Figma's event loop every 500 nodes instead of after every node (the per-node `setTimeout(0)` was clamped to 4–10 ms each, dominating wall time on large pages).
+- **`mainComponentCache`** — `getMainComponentAsync` is called once per unique main component, not once per `INSTANCE`.
+
+**Resilience**
+
+- **Broken component sets no longer kill the export.** Getters like `instance.componentProperties` and `getMainComponentAsync` can throw on instances whose remote library has structural errors. Each is now wrapped individually; the failing instance becomes an error stub with a structured diagnostic, and the rest of the tree exports normally.
+- **`framelinkExport.errors`** — a new top-level array listing every skipped node (id, name, type, ancestor path, error message). The MCP server reads this so your agent knows which subtrees are incomplete.
+- **Rich broken-instance diagnostics.** When an instance fails, the dev console gets a JSON dump that probes each related getter individually (variantProperties, componentProperties, overrides, main component, component set, property definitions) so the root cause is obvious.
+
+**UX**
+
+- **Instant Export → Cancel button swap.** A double `requestAnimationFrame` defers the sandbox work by one paint frame, guaranteeing the UI updates before the export blocks. Shows "Preparing export…" immediately on click.
+- **Skipped-nodes toast.** Success toast surfaces up to 5 example skipped nodes with a pointer to `framelinkExport.errors`.
+
+**Debug**
+
+- Structured logs at every phase boundary with timings.
+- Per-asset-type byte totals (PNG / SVG / image fills).
+- New filter-ratio log line: `assets/svg: 23 worth exporting (filtered out 1222 of 1245 candidates: invisible / zero-area / single-trivial-primitive) in 18ms`.
+
+### 1.2.0
+
+- Initial public release on the Figma Community.
+- JSON export (selection or full page) mirroring the Figma REST API shape.
+- Asset export: PNG frame renders, SVG icon subtrees, image-fill bytes.
+- Inline ZIP packager with custom filename, progress bar, cancel button.
 
 ## Project structure
 

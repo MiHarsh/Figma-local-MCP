@@ -4,7 +4,18 @@
       "release-type": "node",
       "changelog-path": "CHANGELOG.md",
       "bump-minor-pre-major": true,
-      "include-component-in-tag": false
+      "include-component-in-tag": false,
+      "exclude-paths": ["figma-plugin"]
+    },
+    "figma-plugin": {
+      "release-type": "node",
+      "package-name": "framelink-figma-plugin",
+      "changelog-path": "CHANGELOG.md",
+      "bump-minor-pre-major": false,
+      "include-component-in-tag": true,
+      "component": "figma-plugin",
+      "tag-separator": "-",
+      "include-paths": ["figma-plugin"]
     }
   }
 }

@@ -15,9 +15,15 @@ jobs:
     if: ${{ github.repository_owner == 'MiHarsh' }}
     runs-on: ubuntu-latest
     outputs:
-      release_created: ${{ steps.release.outputs.release_created }}
-      tag_name: ${{ steps.release.outputs.tag_name }}
-      version: ${{ steps.release.outputs.major }}.${{ steps.release.outputs.minor }}.${{ steps.release.outputs.patch }}
+      # Root MCP server (npm package) outputs. These keep their original names
+      # so downstream jobs (standalone-binaries, server.json updater) don't change.
+      release_created: ${{ steps.release.outputs['.--release_created'] }}
+      tag_name: ${{ steps.release.outputs['.--tag_name'] }}
+      version: ${{ steps.release.outputs['.--major'] }}.${{ steps.release.outputs['.--minor'] }}.${{ steps.release.outputs['.--patch'] }}
+      # Figma plugin outputs. Plugin and server release independently — a
+      # plugin-only commit must never bump or republish the npm package.
+      plugin_release_created: ${{ steps.release.outputs['figma-plugin--release_created'] }}
+      plugin_tag_name: ${{ steps.release.outputs['figma-plugin--tag_name'] }}
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
     steps:
@@ -25,42 +31,42 @@ jobs:
         id: release
 
       - uses: actions/checkout@v4
-        if: ${{ steps.release.outputs.release_created }}
+        if: ${{ steps.release.outputs['.--release_created'] }}
 
       - uses: pnpm/action-setup@v4
         with:
           version: 10.10.0
-        if: ${{ steps.release.outputs.release_created }}
+        if: ${{ steps.release.outputs['.--release_created'] }}
 
       - uses: actions/setup-node@v4
         with:
           node-version: 24
           registry-url: "https://registry.npmjs.org"
-        if: ${{ steps.release.outputs.release_created }}
+        if: ${{ steps.release.outputs['.--release_created'] }}
 
       - name: Install dependencies
         run: pnpm install
-        if: ${{ steps.release.outputs.release_created }}
+        if: ${{ steps.release.outputs['.--release_created'] }}
 
       - name: Type check
         run: pnpm type-check
-        if: ${{ steps.release.outputs.release_created }}
+        if: ${{ steps.release.outputs['.--release_created'] }}
 
       - name: Build
         run: pnpm build
-        if: ${{ steps.release.outputs.release_created }}
+        if: ${{ steps.release.outputs['.--release_created'] }}
 
       - name: Publish to npm
         run: pnpm publish --no-git-checks --provenance --access public
         env:
           NODE_ENV: production
-        if: ${{ steps.release.outputs.release_created }}
+        if: ${{ steps.release.outputs['.--release_created'] }}
 
       - name: Update server.json version
         run: |
-          VERSION="${{ steps.release.outputs.major }}.${{ steps.release.outputs.minor }}.${{ steps.release.outputs.patch }}"
+          VERSION="${{ steps.release.outputs['.--major'] }}.${{ steps.release.outputs['.--minor'] }}.${{ steps.release.outputs['.--patch'] }}"
           jq --arg v "$VERSION" '.version = $v | .packages[0].version = $v' server.json > server.tmp && mv server.tmp server.json
-        if: ${{ steps.release.outputs.release_created }}
+        if: ${{ steps.release.outputs['.--release_created'] }}
 
   # Build standalone binaries so users can download from GitHub Releases
   # without needing Node.js installed
@@ -110,10 +116,11 @@ jobs:
         run: gh release upload ${{ needs.release-please.outputs.tag_name }} ${{ matrix.artifact }} --clobber
 
   # Build Figma plugin and upload as a zip so users can download and
-  # import directly without cloning the repo
+  # import directly without cloning the repo. Gated on the plugin's own
+  # release so plugin-only commits trigger this without touching npm.
   figma-plugin:
     needs: release-please
-    if: ${{ needs.release-please.outputs.release_created }}
+    if: ${{ needs.release-please.outputs.plugin_release_created }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -140,4 +147,4 @@ jobs:
       - name: Upload plugin zip to GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release upload ${{ needs.release-please.outputs.tag_name }} figma-plugin.zip --clobber
+        run: gh release upload ${{ needs.release-please.outputs.plugin_tag_name }} figma-plugin.zip --clobber
